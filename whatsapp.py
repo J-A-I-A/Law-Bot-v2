@@ -16,9 +16,10 @@ WHATSAPP_PHONE_ID = os.getenv("WHATAPP_PHONE_ID")  # NOTE: env var name as spell
 # Token you set in the Meta App webhook configuration (GET verification handshake)
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 
-# Always-on calling bridge (see calling.py). Meta delivers both `messages` and
-# `calls` events to this single webhook URL, so voice calls are forwarded here.
-CALLING_BRIDGE_URL = os.getenv("CALLING_BRIDGE_URL")
+# Voice calls are handled natively by ElevenLabs Agents (the WABA is imported
+# there and an agent is assigned to the number). Meta may still deliver `calls`
+# webhook events here; they must be acknowledged and IGNORED — acting on them
+# (accept/terminate) races the ElevenLabs call handling and drops live calls.
 
 GRAPH_API_VERSION = "v25.0"
 GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WHATSAPP_PHONE_ID}/messages"
@@ -129,23 +130,6 @@ def _extract_call(payload: dict):
     return calls_list[0]
 
 
-def _forward_call_to_bridge(call: dict) -> None:
-    """Hand a call event to the always-on calling bridge and return immediately."""
-    if not CALLING_BRIDGE_URL:
-        logging.error("Received a call event but CALLING_BRIDGE_URL is not set; ignoring.")
-        return
-    try:
-        response = requests.post(
-            f"{CALLING_BRIDGE_URL.rstrip('/')}/start_call",
-            json={"call": call},
-            timeout=10,
-        )
-        response.raise_for_status()
-        logging.info(f"Forwarded call {call.get('id')} ({call.get('event')}) to the bridge.")
-    except requests.RequestException as exc:
-        logging.error(f"Failed to forward call to bridge: {exc}")
-
-
 @bp.route(
     route="whatsapp_webhook",
     methods=[func.HttpMethod.GET, func.HttpMethod.POST],
@@ -176,12 +160,14 @@ def whatsapp_webhook(req: func.HttpRequest, outqueue: func.Out[str]) -> func.Htt
         logging.warning("Received a webhook POST with an invalid JSON body.")
         return func.HttpResponse("Bad Request", status_code=400)
 
-    # Voice calls arrive under the `calls` field. Forward them to the always-on
-    # bridge (which does the WebRTC/Realtime work) and acknowledge immediately.
+    # Voice calls arrive under the `calls` field. ElevenLabs handles them
+    # natively, so just acknowledge — never accept/terminate from here.
     call = _extract_call(payload)
     if call is not None:
-        logging.info(f"Received WhatsApp call event '{call.get('event')}' ({call.get('id')}).")
-        _forward_call_to_bridge(call)
+        logging.info(
+            f"Ignoring WhatsApp call event '{call.get('event')}' ({call.get('id')}); "
+            "calls are handled by ElevenLabs."
+        )
         return func.HttpResponse(status_code=200)
 
     message = _extract_message(payload)
