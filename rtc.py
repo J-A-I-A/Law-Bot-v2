@@ -1,81 +1,79 @@
 import asyncio
 import base64
-import json
-import requests
-import os
-import httpx
 import fractions
+import json
 import logging
+import os
 import re
 import urllib.parse
 import av
+import httpx
 import numpy as np
+import requests
+import websocket
 import websockets
-from websockets.exceptions import ConnectionClosed
+from bot import Law_bot
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCConfiguration, RTCIceServer
+from aiortc.contrib.media import MediaRelay
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse,Response, PlainTextResponse
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
-from aiortc.contrib.media import MediaRelay
-from openai import AsyncOpenAI
-
+from fastapi.responses import JSONResponse, Response, PlainTextResponse
+from websockets.exceptions import ConnectionClosed
 
 load_dotenv()
+active_call_tasks = set()
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-MODEL_API_KEY = os.getenv("MODEL_API_KEY")
-META_PHONE_ID = os.getenv("META_PHONE_NUMBER_ID")
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
-MODEL = os.getenv("MODEL")
-ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY").strip()
-# Annakay Voice ID
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+ELEVENLABS_AGENT_ID = (os.getenv("ELEVENLABS_AGENT_ID") or "").strip()
+ELEVENLABS_VOICE_ID = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
+META_PHONE_ID = (os.getenv("META_PHONE_NUMBER_ID") or "").strip()
+META_ACCESS_TOKEN = (os.getenv("META_ACCESS_TOKEN") or "").strip()
 VERIFY_TOKEN = "audiostreamtests"
+
+ELEVENLABS_STT_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
+ELEVENLABS_TTS_BASE_URL = "wss://api.elevenlabs.io/v1/text-to-speech"
+ELEVENLABS_TTS_MODEL_ID = "eleven_turbo_v2_5"
+ELEVENLABS_TTS_VOICE_SETTINGS = {"stability": 0.6, "similarity_boost": 0.1, "speed": 1.0}
+
+STUN_URL = os.getenv("STUN_URL", "").strip()
+TURN_URL = os.getenv("TURN_URL", "").strip()
+TURN_USERNAME = os.getenv("TURN_USERNAME", "").strip()
+TURN_CREDENTIAL = os.getenv("TURN_CREDENTIAL", "").strip()
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
 
-# TODO: 
-# deepseek_client = AsyncOpenAI(
-#     api_key=DEEPSEEK_API_KEY,
-#     base_url="https://api.deepseek.com"
-# )
 
-import base64
-import json
-import asyncio
-import urllib.parse
-import websockets
-import numpy as np
-
-async def process_incoming_audio_track(track, api_key: str):
-    """
-    Streams WebRTC caller audio frames to ElevenLabs Scribe Realtime STT.
-    Includes diagnostic logging for frame reception and audio energy.
-    """
-    if not api_key:
-        logger.error("[STT Error] ELEVENLABS_API_KEY is missing or empty.")
+async def process_incoming_audio_track(track, ELEVENLABS_API_KEY: str, audio_output_queue):
+    if not ELEVENLABS_API_KEY:
+        logger.error("[Pipeline Error] ELEVENLABS_API_KEY is missing.")
         return
 
     stt_params = urllib.parse.urlencode({
         "model_id": "scribe_v2_realtime",
         "sample_rate": "16000",
-        "audio_format": "pcm_16000"
+        "audio_format": "pcm_16000",
+        "commit_strategy": "vad",
+        "vad_threshold": "0.6",
+        "vad_silence_threshold_secs": "0.4",
+        "min_speech_duration_ms": "150",
+        "min_silence_duration_ms": "400"
+
     })
     stt_url = f"wss://api.elevenlabs.io/v1/speech-to-text/realtime?{stt_params}"
-    extra_headers = {"xi-api-key": api_key}
-
-    logger.info("[STT] Opening WebSocket connection to ElevenLabs Scribe...")
+    extra_headers = {"xi-api-key": ELEVENLABS_API_KEY}
 
     try:
-        async with websockets.connect(stt_url, additional_headers=extra_headers) as stt_ws:
+        async with (
+            websockets.connect(stt_url, additional_headers=extra_headers) as stt_ws
+            ):
             print("\n==========================================================")
-            print(">>> [STT CONNECTED SUCCESSFULLY] Speak into your phone! <<<")
+            print(">>> [PIPELINE CONNECTED SUCCESSFULLY] Speak into your phone! <<<")
             print("==========================================================\n")
 
             async def send_audio_frames():
                 frame_count = 0
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
                 try:
                     while True:
                         # Fetch frame with 2s timeout to log if WebRTC audio is stuck
@@ -85,39 +83,43 @@ async def process_incoming_audio_track(track, api_key: str):
                             print("[STT WebRTC] Waiting for incoming audio frames from phone...")
                             continue
 
-                        # Convert frame to numpy int16
-                        pcm_array = frame.to_ndarray()
+                        if frame_count == 0:
+                            logger.info(
+                                "[STT Audio Format] format=%s rate=%s layout=%s samples=%s",
+                                frame.format.name,
+                                frame.sample_rate,
+                                frame.layout.name,
+                                frame.samples,
+                            )
 
-                        # Ensure 1D array
-                        if pcm_array.ndim > 1:
-                            pcm_array = pcm_array[0]
-                        pcm_array = np.ascontiguousarray(pcm_array.flatten(), dtype=np.int16)
-
-                        # Downsample 48kHz -> 16kHz
-                        resampled_pcm = pcm_array[::3]
-                        
-                        # Diagnostic: Calculate RMS volume level to verify audio is not silent
-                        rms = float(np.sqrt(np.mean(resampled_pcm.astype(np.float32)**2))) if len(resampled_pcm) > 0 else 0
-                        
-                        audio_bytes = resampled_pcm.tobytes()
-                        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-                        payload = {
-                            "message_type": "input_audio_chunk",
-                            "audio_base_64": audio_b64
-                        }
-                        await stt_ws.send(json.dumps(payload))
+                        for resampled_frame in resampler.resample(frame):
+                            pcm_array = np.ascontiguousarray(
+                                resampled_frame.to_ndarray().reshape(-1),
+                                dtype=np.int16,
+                            )
+                            rms = (
+                                float(np.sqrt(np.mean(pcm_array.astype(np.float32) ** 2)))
+                                if len(pcm_array) > 0
+                                else 0
+                            )
+                            payload = {
+                                "message_type": "input_audio_chunk",
+                                "audio_base_64": base64.b64encode(pcm_array.tobytes()).decode("utf-8"),
+                            }
+                            await stt_ws.send(json.dumps(payload))
 
                         frame_count += 1
                         if frame_count % 100 == 0:
                             print(f"[STT Active] Streamed {frame_count} frames (~2s) | Audio RMS Level: {rms:.1f}")
 
                 except asyncio.CancelledError:
-                    pass
+                    raise
+                except ConnectionClosed:
+                    logger.info("[STT Outbound] Websocket closed while streaming audio.")
                 except Exception as e:
-                    logger.error(f"[STT Outbound Error]: {e}")
+                    logger.error(f"[STT Outbound Error] {type(e).__name__}: {e!r}")
 
-            async def listen_for_transcripts():
+            async def listen_for_transcripts(stt_ws, audio_output_queue):
                 try:
                     async for message in stt_ws:
                         data = json.loads(message)
@@ -127,6 +129,15 @@ async def process_incoming_audio_track(track, api_key: str):
                             print(f"\n[STT SESSION ACTIVE]: Session ID = {data.get('session_id')}\n")
                             continue
 
+                        if msg_type == "committed_transcript":
+                            text = data.get("text", "").strip()
+                            if text:
+                                print(f"\n[USER STT]: {text}\n")
+                                asyncio.create_task(send_to_llm(text, audio_output_queue))
+                            else:
+                                logger.info("[STT Committed Transcript] Received empty transcript.")
+                            continue                               
+                            
                         # Print partial, final, or committed transcripts
                         text = data.get("text", "").strip()
                         if text:
@@ -139,10 +150,23 @@ async def process_incoming_audio_track(track, api_key: str):
 
                 except asyncio.CancelledError:
                     pass
+                except ConnectionClosed:
+                    logger.info("[STT Inbound] Websocket closed.")
                 except Exception as e:
-                    logger.error(f"[STT Inbound Error]: {e}")
+                    logger.error(f"[STT Inbound Error] {type(e).__name__}: {e!r}")
 
-            await asyncio.gather(send_audio_frames(), listen_for_transcripts())
+            sender_task = asyncio.create_task(send_audio_frames())
+            listener_task = asyncio.create_task(
+                listen_for_transcripts(stt_ws, audio_output_queue)
+            )
+            done, pending = await asyncio.wait(
+                (sender_task, listener_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.gather(*done, return_exceptions=True)
 
     except websockets.exceptions.InvalidStatus as err:
         logger.error(f"[STT Reject] HTTP Status: {err.response.status_code}")
@@ -150,52 +174,6 @@ async def process_incoming_audio_track(track, api_key: str):
         logger.info("[STT WebSocket] Connection closed cleanly.")
     except Exception as e:
         logger.error(f"[STT Exception]: {e}")
-
-async def play_elevenlabs_greeting(voice_id: str, api_key: str, audio_queue: asyncio.Queue):
-    """
-    Triggers ElevenLabs TTS for the greeting message and queues 20ms PCM audio chunks 
-    into audio_queue for WebRTC playback.
-    """
-    print("[ElevenLabs] Requesting initial greeting audio...")
-    
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format=pcm_48000"
-    
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "text": "Hello! Thank you for calling. How can I help you today?",
-        "model_id": "eleven_turbo_v2_5"
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            async with client.stream("POST", url, headers=headers, json=payload) as response:
-                if response.status_code != 200:
-                    body = await response.aread()
-                    logger.error(f"[ElevenLabs Error] {response.status_code}: {body}")
-                    return
-               
-                frame_size = 1920
-                buffer = bytearray()
-
-                async for chunk in response.aiter_bytes():
-                    buffer.extend(chunk)
-                    while len(buffer) >= frame_size:
-                        frame_bytes = bytes(buffer[:frame_size])
-                        buffer = buffer[frame_size:]
-                        await audio_queue.put(frame_bytes)
-
-                if len(buffer) > 0:
-                    padded = bytes(buffer) + b'\x00' * (frame_size - len(buffer))
-                    await audio_queue.put(padded)
-
-        logger.info("[ElevenLabs] Greeting audio queued successfully!")
-
-    except Exception as e:
-        logger.error(f"[ElevenLabs Error] Streaming failed: {e}")
 
 def normalize_meta_sdp_answer(answer_sdp: str) -> str:
     if not answer_sdp:
@@ -235,18 +213,49 @@ async def process_call_session(payload: dict, meta_sdp_offer: str):
         return
         
     call_id = calls[0].get("id")
+    print("\n========== META SDP OFFER ==========")
+    print(meta_sdp_offer, flush=True)
+    print("======== END META SDP OFFER ========\n", flush=True)
+# STUN and TURN server configuration for WebRTC
+    config = RTCConfiguration(
+        iceServers=[
+            RTCIceServer(urls = STUN_URL),
+            RTCIceServer(
+                urls = TURN_URL,
+                username= TURN_USERNAME,
+                credential= TURN_CREDENTIAL 
+            )
+        ]
+    )
 
-    pc = RTCPeerConnection()
+    pc = RTCPeerConnection(configuration=config)
     audio_queue = asyncio.Queue()
-    inbound_audio_track = None
-    stt_task_started = False  # Lock flag to prevent duplicate connections
+    call_active_event = asyncio.Event()
+    pipeline_started = False
+
+    @pc.on("iceconnectionstatechange")
+    def on_ice_connection_state_change():
+        state = pc.iceConnectionState
+        logger.info("[WebRTC] ICE connection state changed: %s", state)
+
+        if state in ("failed", "closed"):
+            call_active_event.set()
 
     @pc.on("track")
     def on_track(track):
-        nonlocal inbound_audio_track
-        if track.kind == "audio":
-            logger.info("[WebRTC] Inbound caller audio track captured.")
-            inbound_audio_track = track
+        nonlocal pipeline_started
+
+        if track.kind != "audio" or pipeline_started:
+            return
+
+        pipeline_started = True
+        logger.info("[WebRTC] Inbound caller audio track captured.")
+
+        pipeline_task = asyncio.create_task(
+            process_incoming_audio_track(track, ELEVENLABS_API_KEY, audio_queue)
+        )
+        active_call_tasks.add(pipeline_task)
+        pipeline_task.add_done_callback(active_call_tasks.discard)
 
     # Set Remote Offer and Audio Transceiver setup
     offer = RTCSessionDescription(sdp=meta_sdp_offer, type="offer")
@@ -286,33 +295,42 @@ async def process_call_session(payload: dict, meta_sdp_offer: str):
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(meta_url, headers=headers, json=accept_payload)
-        logger.info(f"[Meta Accept Response]: {resp.status_code} - {resp.text}")
+    async def cleanup_call():
+        try:
+            await call_active_event.wait()
+        finally:
+            logger.info("[Call Ended] Closing WebRTC peer connection.")
+            await pc.close()
 
-        if resp.status_code == 200 and not stt_task_started:
-            stt_task_started = True  # Set lock
-            logger.info("[Call Answered] Starting TTS Greeting & Realtime STT...")
+    cleanup_task = asyncio.create_task(cleanup_call())
+    active_call_tasks.add(cleanup_task)
+    cleanup_task.add_done_callback(active_call_tasks.discard)
 
-            # Outbound greeting
-            asyncio.create_task(
-                play_elevenlabs_greeting(
-                    voice_id=ELEVENLABS_VOICE_ID,
-                    api_key=ELEVENLABS_API_KEY,
-                    audio_queue=audio_queue
-                )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                meta_url,
+                headers=headers,
+                json=accept_payload,
             )
 
-            # Inbound STT (single task)
-            if inbound_audio_track:
-                asyncio.create_task(
-                    process_incoming_audio_track(
-                        track=inbound_audio_track,
-                        api_key=ELEVENLABS_API_KEY
-                    )
-                )
+        logger.info(
+            "[Meta Accept Response]: %s - %s",
+            resp.status_code,
+            resp.text,
+        )
 
-    await asyncio.Event().wait()
+        if resp.status_code != 200:
+            call_active_event.set()
+            raise RuntimeError(
+                f"Meta rejected call: {resp.status_code} {resp.text}"
+            )
+
+        return cleaned_sdp
+
+    except Exception:
+        call_active_event.set()
+        raise
 
 @app.get("/whatsapp-call")
 async def verify_webhook(request: Request):
@@ -357,10 +375,17 @@ async def handle_meta_calling_webhook(request: Request):
     if event_type and event_type != "connect":
         logger.info("Received event '%s' for call %s", event_type, call_id)
         return JSONResponse(status_code=200, content={"status": "acknowledged"})
+    
 
     if meta_sdp_offer:
-        asyncio.create_task(process_call_session(payload, meta_sdp_offer))
-        return JSONResponse(status_code=200, content={"status": "processing"})
+        sdp_answer = await process_call_session(payload, meta_sdp_offer)
+
+        # active_call_tasks.add(call_task)
+        # call_task.add_done_callback(active_call_tasks.discard)
+        # sdp_answer = await call_task
+        return JSONResponse(
+            status_code=200, content={"status": "accepted", "sdp_answer": sdp_answer}
+        )
 
     return JSONResponse(status_code=200, content={"status": "ignored"})
 
@@ -373,12 +398,44 @@ class CustomAudioStreamTrack(MediaStreamTrack):
         self.pts = 0
         self.sample_rate = 48000
         self.samples_per_frame = 960  # 20ms frame at 48kHz
+        self.frame_size_bytes = self.samples_per_frame * 2
+        self.pending_audio = bytearray()
+        self.audio_stream_ended = False
+        self.audio_frames_sent = 0
 
     async def recv(self):
-        try:
-            raw_pcm = self.audio_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            raw_pcm = np.zeros(self.samples_per_frame, dtype=np.int16).tobytes()
+        loop = asyncio.get_running_loop()
+        frame_deadline = loop.time() + 0.02
+
+        while len(self.pending_audio) < self.frame_size_bytes:
+            timeout = frame_deadline - loop.time()
+            if timeout <= 0:
+                break
+            try:
+                audio_chunk = await asyncio.wait_for(self.audio_queue.get(), timeout)
+            except asyncio.TimeoutError:
+                break
+
+            if audio_chunk is None:
+                self.audio_stream_ended = True
+                break
+
+            self.pending_audio.extend(audio_chunk)
+            self.audio_stream_ended = False
+
+        if len(self.pending_audio) >= self.frame_size_bytes:
+            raw_pcm = bytes(self.pending_audio[:self.frame_size_bytes])
+            del self.pending_audio[:self.frame_size_bytes]
+        elif self.audio_stream_ended and self.pending_audio:
+            raw_pcm = bytes(self.pending_audio).ljust(self.frame_size_bytes, b"\x00")
+            self.pending_audio.clear()
+            self.audio_stream_ended = False
+        else:
+            raw_pcm = bytes(self.frame_size_bytes)
+
+        remaining_frame_time = frame_deadline - loop.time()
+        if remaining_frame_time > 0:
+            await asyncio.sleep(remaining_frame_time)
 
         # Convert raw PCM16 bytes into numpy array
         audio_data = np.frombuffer(raw_pcm, dtype=np.int16).reshape(1, -1)
@@ -390,58 +447,116 @@ class CustomAudioStreamTrack(MediaStreamTrack):
         frame.time_base = fractions.Fraction(1, self.sample_rate)
 
         self.pts += self.samples_per_frame
-        await asyncio.sleep(0.02)
+        if self.audio_frames_sent == 0 and np.any(audio_data):
+            logger.info("[TTS Audio] First non-silent PCM frame sent to WebRTC.")
+        if np.any(audio_data):
+            self.audio_frames_sent += 1
         return frame
 
 async def stream_elevenlabs_tts(text_stream, audio_output_queue):
     tts_url = (
-        f"wss://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream-input"
-        f"?model_id=eleven_turbo_v2_5&output_format=pcm_16000"
+        f"{ELEVENLABS_TTS_BASE_URL}/{ELEVENLABS_VOICE_ID}/stream-input"
+        f"?model_id={ELEVENLABS_TTS_MODEL_ID}&output_format=pcm_48000"
     )
     header = {"xi-api-key": ELEVENLABS_API_KEY}
-    async with websockets.connect(tts_url,additional_headers=headers) as tts_ws:
-        await tts_ws.send(json.dumps({
-            "text": " ",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}
-        }))
+
+    async with websockets.connect(tts_url, additional_headers=header) as tts_ws:
+        await tts_ws.send(
+            json.dumps({
+                "text": " ",
+                "voice_settings": ELEVENLABS_TTS_VOICE_SETTINGS,
+                "language_code": "en",
+            })
+        )
 
         async def send_text_chunks():
+            text_buffer = ""
+
             async for text_chunk in text_stream:
-                if text_chunk:
-                    await tts_ws.send(json.dumps({
-                        "text": text_chunk,
-                        "try_trigger_generation": True
-                    }))
-        
+                if not text_chunk:
+                    continue
+
+                text_buffer += text_chunk
+                while True:
+                    boundary = re.search(r"[.!?;:]\s+", text_buffer)
+                    if boundary:
+                        split_at = boundary.end()
+                    elif len(text_buffer) >= 120:
+                        split_at = text_buffer.rfind(" ", 0, 120)
+                        if split_at <= 0:
+                            split_at = 120
+                    else:
+                        break
+
+                    phrase = text_buffer[:split_at]
+                    text_buffer = text_buffer[split_at:]
+                    await tts_ws.send(
+                        json.dumps({
+                            "text": phrase,
+                            "try_trigger_generation": True,
+                        })
+                    )
+
+            if text_buffer.strip():
+                await tts_ws.send(
+                    json.dumps({
+                        "text": text_buffer,
+                        "try_trigger_generation": True,
+                    })
+                )
+            await tts_ws.send(json.dumps({"text": ""}))
+        # revisit TODO
         async def receive_audio_chunks():
-            async for message in tts_ws:
-                data = json.loads(message)
-                if data.get("audio"):
-                    audio_bytes = base64.b64decode(data["audio"])
-                    await audio_output_queue.put(audio_bytes)
+            try:
+                async for message in tts_ws:
+                    data = json.loads(message)
+
+                    if data.get("audio"):
+                        await audio_output_queue.put(base64.b64decode(data["audio"]))
+
+                    if data.get("isFinal"):
+                        break
+            finally:
+                await audio_output_queue.put(None)
+
         await asyncio.gather(send_text_chunks(), receive_audio_chunks())
 
-async def process_deepseek_llm(transcript, audio_output_queue):
+async def send_to_llm(transcript: str, audio_output_queue):
     print(f"\n[Whatsapp User]: {transcript}")
-    print(f"[Deepseek Response]: ", end="", flush=True)
+    print("[LLM Response]: ", end="", flush=True)
 
-    # revisit llm transcript
-    response = await deepseek_client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[
-            {"role": "system", "content": "You are a concise voice phone assistant. Keep responses under 2 sentences and conversational."},
-            {"role": "user", "content": transcript}
-        ],
-        stream=True
-    )
+    try:
+        loop = asyncio.get_running_loop()
+        text_queue = asyncio.Queue()
 
-    async def text_generator():
-        async for chunk in response:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                print(delta, end="", flush=True)
-                yield delta
-    await stream_elevenlabs_tts(text_generator(), audio_output_queue)
+        async def text_generator():
+            while True:
+                text_chunk = await text_queue.get()
+                if text_chunk is None:
+                    break
+                yield text_chunk
+
+        def on_delta(text_chunk: str):
+            print(text_chunk, end="", flush=True)
+            loop.call_soon_threadsafe(text_queue.put_nowait, text_chunk)
+
+        tts_task = asyncio.create_task(
+            stream_elevenlabs_tts(text_generator(), audio_output_queue)
+        )
+        try:
+            await asyncio.to_thread(
+                Law_bot,
+                previous_message=[],
+                question=transcript,
+                on_delta=on_delta,
+            )
+        finally:
+            await text_queue.put(None)
+            await tts_task
+        print(flush=True)
+
+    except Exception as e:
+        logger.error(f"[LLM Error]: {e}")
 
 if __name__ == "__main__":
     import uvicorn
